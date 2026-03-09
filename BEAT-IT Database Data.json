@@ -1,0 +1,100 @@
+{
+  "live_predictions": {
+    "-O_WKNSLy2XEd6tB7LV2": {
+      "input_data": {
+        "age": 22,
+        "chol": 100,
+        "sex": 1,
+        "thalach": 78,
+        "trestbps": 100
+      },
+      "predicted_label": 0,
+      "probability_disease": 0.43291288623167085,
+      "timestamp": "2025-09-19T09:36:58.651676"
+    },
+    "-O_WNciaJB_oHivQUY25": {
+      "input_data": {
+        "age": 22,
+        "sex": 1,
+        "thalach": 71,
+        "trestbps": 100
+      },
+      "predicted_label": 0,
+      "probability_disease": 0.47298813837692266,
+      "timestamp": "2025-09-19T09:51:11.760548"
+    },
+    "-O__L-AMPvxwSWZE860S": {
+      "input_data": {
+        "age": 22,
+        "sex": 1,
+        "thalach": 76,
+        "trestbps": 100
+      },
+      "predicted_label": 1,
+      "probability_disease": 0.5713044520178794,
+      "timestamp": "2025-09-20T04:18:10.418225"
+    },
+    "-O__LmF8CGODAGUL64Cp": {
+      "input_data": {
+        "age": 22,
+        "sex": 1,
+        "thalach": 76,
+        "trestbps": 120
+      },
+      "predicted_label": 1,
+      "probability_disease": 0.5713044520178794,
+      "timestamp": "2025-09-20T04:21:35.521933"
+    },
+    "-O__MeZ6t2uFzC9WNEDk": {
+      "input_data": {
+        "age": 22,
+        "sex": 1,
+        "thalach": 71,
+        "trestbps": 120
+      },
+      "predicted_label": 1,
+      "probability_disease": 0.5789015317234625,
+      "timestamp": "2025-09-20T04:25:26.227798"
+    },
+    "-O__qsfQ-3KCt6LvzSGK": {
+      "input_data": {
+        "age": 22,
+        "sex": 1,
+        "thalach": 71,
+        "trestbps": 110
+      },
+      "predicted_label": 0,
+      "probability_disease": 0.49609262078975946,
+      "timestamp": "2025-09-20T06:41:50.404586"
+    },
+    "-O__vqUyUVoCxXQ_HMeI": {
+      "input_data": {
+        "age": 22,
+        "sex": 1,
+        "thalach": 81,
+        "trestbps": 110
+      },
+      "predicted_label": 0,
+      "probability_disease": 0.4648207518175675,
+      "timestamp": "2025-09-20T07:03:32.242151"
+    }
+  },
+  "predictions": {
+    "-OYdhV0yLZ_JfxjIf72k": {
+      "accuracy": 0.7377049180327869,
+      "f1_macro": 0.7359307359307359,
+      "f1_weighted": 0.7377049180327869,
+      "predicted_disease_count": 28,
+      "predicted_no_disease_count": 33,
+      "test_set_size": 61
+    },
+    "-OZD1KigkZedju1WGHKU": {
+      "accuracy": 0.8852459016393442,
+      "f1_macro": 0.8851224105461393,
+      "f1_weighted": 0.8854311382791517,
+      "predicted_disease_count": 31,
+      "predicted_no_disease_count": 30,
+      "test_set_size": 61
+    }
+  }
+}
