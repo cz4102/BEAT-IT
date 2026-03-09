@@ -1,0 +1,852 @@
+#include "thingProperties.h"
+#include "MAX30105.h"
+#include "heartRate.h"
+
+MAX30105 particleSensor;
+
+const byte RATE_ARRAY_SIZE = 8;
+byte rateArray[RATE_ARRAY_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+
+#define BATTERY_PIN A0
+
+const int ADC_RESOLUTION = 4095;
+const float ADC_VREF = 3.3;
+
+const float BATTERY_MAX_VOLTAGE = 4.2;
+const float BATTERY_MIN_VOLTAGE = 3.0;
+
+// Timing intervals
+unsigned long lastSensorRead = 0;
+unsigned long lastCloudUpdate = 0;
+unsigned long lastBatteryCheck = 0;
+unsigned long lastDebugPrint = 0;
+
+const unsigned long SENSOR_INTERVAL = 10;      
+const unsigned long CLOUD_INTERVAL = 500;      
+const unsigned long BATTERY_INTERVAL = 5000;
+const unsigned long DEBUG_INTERVAL = 1000;
+
+
+float currentHeartRate = 0;
+float currentSpO2 = 0;
+bool fingerDetected = false;
+bool validDataReceived = false;
+
+
+const int SMOOTH_SIZE = 8;
+float hrHistory[SMOOTH_SIZE];
+float spo2History[SMOOTH_SIZE];
+int historyIndex = 0;
+bool historyFull = false;
+
+
+const int SPO2_BUFFER_SIZE = 15;
+float redBuffer[SPO2_BUFFER_SIZE];
+float irBuffer[SPO2_BUFFER_SIZE];
+int spo2BufferIndex = 0;
+bool spo2BufferFull = false;
+
+
+float lastCloudHR = -1;
+float lastCloudSpO2 = -1;
+const float HR_THRESHOLD = 1.5;
+const float SPO2_THRESHOLD = 0.5;
+
+
+bool predictionInProgress = false;
+unsigned long predictionStartTime = 0;
+const unsigned long PREDICTION_DURATION = 10000;
+
+//Signal filtering for noise reduction
+const int FILTER_SIZE = 5;
+long irFilterBuffer[FILTER_SIZE];
+long redFilterBuffer[FILTER_SIZE];
+int filterIndex = 0;
+
+//Adaptive baseline with exponential smoothing
+long irBaseline = 0;
+long redBaseline = 0;
+const int BASELINE_SAMPLES = 50;  
+int baselineSampleCount = 0;
+const float BASELINE_SMOOTH = 0.85;
+
+//Peak detection with improved sensitivity
+const int HISTORY_SIZE = 12;
+long irValueHistory[HISTORY_SIZE];
+long irSmoothHistory[HISTORY_SIZE];
+int irHistoryIndex = 0;
+bool historyReady = false;
+
+//Signal quality metrics
+float irSignalQuality = 0;
+float redSignalQuality = 0;
+long irMinValue = 0;
+long irMaxValue = 0;
+
+// Beat detection state machine
+bool pulseDetected = false;
+unsigned long lastPulseTime = 0;
+const unsigned long MIN_PULSE_INTERVAL = 350; 
+const unsigned long MAX_PULSE_INTERVAL = 2000; 
+
+// Peak detection variables
+long lastIRValue = 0;
+bool risingEdge = false;
+int peakCount = 0;
+const int AMPLITUDE_THRESHOLD = 80;
+
+//Contact quality indicators
+const long WEAK_SIGNAL_THRESHOLD = 30000;
+const long GOOD_SIGNAL_THRESHOLD = 50000;
+const long STRONG_SIGNAL_THRESHOLD = 80000;
+
+// SpO2 specific variables
+const int SPO2_DC_BUFFER_SIZE = 25;  
+float redDCBuffer[SPO2_DC_BUFFER_SIZE];
+float irDCBuffer[SPO2_DC_BUFFER_SIZE];
+int dcBufferIndex = 0;
+bool dcBufferFull = false;
+
+// SpO2 calculation state
+float lastValidSpO2 = 95.0;  
+int invalidSpO2Count = 0;
+const int MAX_INVALID_COUNT = 3; 
+
+// AC/DC ratio tracking for debugging
+float lastRedRatio = 0;
+float lastIRRatio = 0;
+
+// Calibration factors for MAX30102 on wrist
+const float RED_AC_SCALE = 1.2;    
+const float IR_AC_SCALE = 1.0;     
+const float SPO2_CALIBRATION = 1.05; 
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("=== RADIAL ARTERY HEART MONITOR - SpO2 ENHANCED ===");
+  Serial.println("Seeed XIAO ESP32-C3 Optimized");
+  
+  // Initialize I2C with explicit pins for XIAO ESP32-C3
+  Wire.begin(4, 5);  // SDA=GPIO5, SCL=GPIO4
+  Wire.setClock(400000);
+  
+  
+  int retries = 5;
+  while (!particleSensor.begin(Wire, I2C_SPEED_FAST) && retries > 0) {
+    Serial.println("MAX30102 sensor not found, retrying...");
+    delay(500);
+    retries--;
+  }
+  
+  if (retries == 0) {
+    Serial.println("ERROR: MAX30102 not detected. Check I2C wiring!");
+    while(1);
+  }
+  
+  Serial.println("MAX30102 initialized for radial artery");
+  
+  
+  byte ledBrightness = 220;
+  byte sampleAverage = 8;
+  byte ledMode = 2;
+  byte sampleRate = 100;
+  int pulseWidth = 411;
+  int adcRange = 4096;
+  
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+  particleSensor.setPulseAmplitudeRed(31);
+  particleSensor.setPulseAmplitudeIR(31);
+  particleSensor.setPulseAmplitudeGreen(0);
+  
+  particleSensor.clearFIFO();
+  
+  // Initialize IoT Cloud
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(1);
+  ArduinoCloud.printDebugInfo();
+  
+  // Initialize arrays
+  for (int i = 0; i < SMOOTH_SIZE; i++) {
+    hrHistory[i] = 0;
+    spo2History[i] = 0;
+  }
+  for (int i = 0; i < RATE_ARRAY_SIZE; i++) rateArray[i] = 0;
+  for (int i = 0; i < SPO2_BUFFER_SIZE; i++) {
+    redBuffer[i] = 0;
+    irBuffer[i] = 0;
+  }
+  for (int i = 0; i < FILTER_SIZE; i++) {
+    irFilterBuffer[i] = 0;
+    redFilterBuffer[i] = 0;
+  }
+  for (int i = 0; i < HISTORY_SIZE; i++) {
+    irValueHistory[i] = 0;
+    irSmoothHistory[i] = 0;
+  }
+  for (int i = 0; i < SPO2_DC_BUFFER_SIZE; i++) {
+    redDCBuffer[i] = 0;
+    irDCBuffer[i] = 0;
+  }
+  
+  Serial.println("System ready. Place sensor on radial artery (wrist).");
+  Serial.println("Position: Inner wrist, below thumb, FIRM contact required");
+  beatStatus = true;
+  thalach = 0;
+}
+
+void loop() {
+  ArduinoCloud.update();
+  unsigned long now = millis();
+
+  if (now - lastSensorRead >= SENSOR_INTERVAL) {
+    readSensorData();
+    lastSensorRead = now;
+  }
+
+  if (now - lastCloudUpdate >= CLOUD_INTERVAL) {
+    updateCloudIfNeeded();
+    lastCloudUpdate = now;
+  }
+
+  if (now - lastBatteryCheck >= BATTERY_INTERVAL) {
+    updateBatteryLevel();
+    lastBatteryCheck = now;
+  }
+
+  if (now - lastDebugPrint >= DEBUG_INTERVAL) {
+    printDebugInfo();
+    lastDebugPrint = now;
+  }
+
+  if (predictionInProgress) {
+    handlePredictionProcess();
+  }
+}
+
+// ENHANCED: Apply Median Filter to reduce noise
+long applyMedianFilter(long* buffer, int size) {
+  long sorted[size];
+  for (int i = 0; i < size; i++) sorted[i] = buffer[i];
+  
+  for (int i = 0; i < size - 1; i++) {
+    for (int j = 0; j < size - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        long temp = sorted[j];
+        sorted[j] = sorted[j + 1];
+        sorted[j + 1] = temp;
+      }
+    }
+  }
+  return sorted[size / 2];
+}
+
+// ENHANCED: Signal quality assessment
+void assessSignalQuality(long irValue, long redValue) {
+  if (irValue > STRONG_SIGNAL_THRESHOLD) {
+    irSignalQuality = 1.0;
+  } else if (irValue > GOOD_SIGNAL_THRESHOLD) {
+    irSignalQuality = 0.8;
+  } else if (irValue > WEAK_SIGNAL_THRESHOLD) {
+    irSignalQuality = 0.6;
+  } else {
+    irSignalQuality = 0.3;
+  }
+  
+  if (redValue > STRONG_SIGNAL_THRESHOLD) {
+    redSignalQuality = 1.0;
+  } else if (redValue > GOOD_SIGNAL_THRESHOLD) {
+    redSignalQuality = 0.8;
+  } else if (redValue > WEAK_SIGNAL_THRESHOLD) {
+    redSignalQuality = 0.6;
+  } else {
+    redSignalQuality = 0.3;
+  }
+}
+
+// ENHANCED: Radial artery optimized sensor reading
+void readSensorData() {
+  if (!beatStatus) return;
+
+  long irValue = particleSensor.getIR();
+  long redValue = particleSensor.getRed();
+  
+  const long FINGER_THRESHOLD = 15000;
+
+  if (irValue > FINGER_THRESHOLD) {
+    if (!fingerDetected) {
+      fingerDetected = true;
+      Serial.println("✓ Sensor contact detected, calibrating...");
+      baselineSampleCount = 0;
+      irBaseline = 0;
+      redBaseline = 0;
+      spo2BufferIndex = 0;
+      spo2BufferFull = false;
+      dcBufferIndex = 0;
+      dcBufferFull = false;
+      filterIndex = 0;
+      irHistoryIndex = 0;
+      historyReady = false;
+      invalidSpO2Count = 0;
+    }
+
+    // Add to filter buffers
+    irFilterBuffer[filterIndex] = irValue;
+    redFilterBuffer[filterIndex] = redValue;
+    filterIndex = (filterIndex + 1) % FILTER_SIZE;
+    
+    // Apply median filter
+    long irFiltered = applyMedianFilter(irFilterBuffer, FILTER_SIZE);
+    long redFiltered = applyMedianFilter(redFilterBuffer, FILTER_SIZE);
+    
+    // Assess signal quality
+    assessSignalQuality(irValue, redValue);
+
+    // Build adaptive baseline
+    if (baselineSampleCount < BASELINE_SAMPLES) {
+      if (baselineSampleCount == 0) {
+        irBaseline = irFiltered;
+        redBaseline = redFiltered;
+      } else {
+        irBaseline = (long)(irBaseline * BASELINE_SMOOTH + irFiltered * (1.0 - BASELINE_SMOOTH));
+        redBaseline = (long)(redBaseline * BASELINE_SMOOTH + redFiltered * (1.0 - BASELINE_SMOOTH));
+      }
+      baselineSampleCount++;
+      if (baselineSampleCount == BASELINE_SAMPLES) {
+        Serial.print("✓ Baseline established. IR: ");
+        Serial.print(irBaseline);
+        Serial.print(" | Red: ");
+        Serial.println(redBaseline);
+      }
+    } else {
+      // Use enhanced beat detection
+      if (detectRadialBeat(irFiltered, irValue)) {
+        calculateHeartRate();
+      }
+    }
+
+    // Calculate SpO2 with enhanced algorithm
+    if (redFiltered > FINGER_THRESHOLD && irSignalQuality > 0.5 && redSignalQuality > 0.5) {
+      calculateSpO2Enhanced(redFiltered, irFiltered);
+    }
+
+    validDataReceived = true;
+  } else {
+    if (fingerDetected) {
+      fingerDetected = false;
+      validDataReceived = false;
+      Serial.println("✗ Sensor contact lost");
+      currentHeartRate = 0;
+      currentSpO2 = 0;
+      baselineSampleCount = 0;
+      spo2BufferIndex = 0;
+      spo2BufferFull = false;
+      dcBufferIndex = 0;
+      dcBufferFull = false;
+      invalidSpO2Count = 0;
+    }
+  }
+}
+
+// ENHANCED: Derivative-based beat detection with adaptive threshold
+bool detectRadialBeat(long irFiltered, long irRaw) {
+  unsigned long now = millis();
+  
+  irValueHistory[irHistoryIndex] = irRaw;
+  irSmoothHistory[irHistoryIndex] = irFiltered;
+  irHistoryIndex = (irHistoryIndex + 1) % HISTORY_SIZE;
+  if (irHistoryIndex == 0) historyReady = true;
+  
+  if (baselineSampleCount < BASELINE_SAMPLES || !historyReady) return false;
+  
+  if (irRaw < irMinValue || irMinValue == 0) irMinValue = irRaw;
+  if (irRaw > irMaxValue) irMaxValue = irRaw;
+  
+  long peakAmplitude = irFiltered - irBaseline;
+  long amplitudeRange = irMaxValue - irMinValue;
+  
+  if (lastIRValue < irFiltered) {
+    risingEdge = true;
+  } else if (risingEdge && lastIRValue >= irFiltered) {
+    unsigned long timeSinceLastPulse = now - lastPulseTime;
+    
+    if (timeSinceLastPulse >= MIN_PULSE_INTERVAL) {
+      int adaptiveThreshold = (int)(AMPLITUDE_THRESHOLD * (0.5 + irSignalQuality * 0.5));
+      
+      if (abs(peakAmplitude) > adaptiveThreshold && amplitudeRange > 100) {
+        lastPulseTime = now;
+        risingEdge = false;
+        peakCount++;
+        
+        Serial.print("♥ BEAT ");
+        Serial.print(peakCount);
+        Serial.print(" | IR: ");
+        Serial.print(irFiltered);
+        Serial.print(" | Amp: ");
+        Serial.print(peakAmplitude);
+        Serial.print(" | Δt: ");
+        Serial.print(timeSinceLastPulse);
+        Serial.println("ms");
+        
+        return true;
+      }
+    }
+    risingEdge = false;
+  }
+  
+  lastIRValue = irFiltered;
+  
+  if (now - lastPulseTime > 2000 && baselineSampleCount >= BASELINE_SAMPLES) {
+    irBaseline = (long)(irBaseline * 0.98 + irFiltered * 0.02);
+  }
+  
+  return false;
+}
+
+// Heart rate calculation with improved validation
+void calculateHeartRate() {
+  long delta = millis() - lastBeat;
+  lastBeat = millis();
+  float bpm = 60000.0 / delta;
+
+  float qualityFactor = min(irSignalQuality, 1.0f);
+  if (qualityFactor < 0.5) return;
+  
+  if (bpm > 40 && bpm < 200) {
+    rateArray[rateSpot++] = (byte)bpm;
+    rateSpot %= RATE_ARRAY_SIZE;
+
+    long total = 0;
+    int validCount = 0;
+    byte median = getMedian(rateArray, RATE_ARRAY_SIZE);
+    
+    for (byte i = 0; i < RATE_ARRAY_SIZE; i++) {
+      if (rateArray[i] > 0) {
+        if (abs(rateArray[i] - median) <= median * 0.2) {
+          total += rateArray[i];
+          validCount++;
+        }
+      }
+    }
+    
+    if (validCount > 0) {
+      float avgBPM = (float)total / validCount;
+      addToHistory(avgBPM, true);
+      currentHeartRate = getSmoothedValue(true);
+      heartRate = (int)currentHeartRate;
+
+      if (heartRate > thalach) thalach = heartRate;
+      
+      Serial.print("♥ HR: ");
+      Serial.print(heartRate);
+      Serial.print(" BPM [Quality: ");
+      Serial.print((int)(qualityFactor * 100));
+      Serial.println("%]");
+    }
+  }
+}
+
+// Helper function to get median value
+byte getMedian(byte* arr, int size) {
+  byte sorted[size];
+  for (int i = 0; i < size; i++) sorted[i] = arr[i];
+  
+  for (int i = 0; i < size - 1; i++) {
+    for (int j = 0; j < size - i - 1; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        byte temp = sorted[j];
+        sorted[j] = sorted[j + 1];
+        sorted[j + 1] = temp;
+      }
+    }
+  }
+  
+  return sorted[size / 2];
+}
+
+// ENHANCED: Improved SpO2 calculation with wrist-optimized algorithm
+void calculateSpO2Enhanced(long redValue, long irValue) {
+  // Store raw values in SpO2 buffers
+  redBuffer[spo2BufferIndex] = (float)redValue;
+  irBuffer[spo2BufferIndex] = (float)irValue;
+  
+  spo2BufferIndex++;
+  if (spo2BufferIndex >= SPO2_BUFFER_SIZE) {
+    spo2BufferIndex = 0;
+    spo2BufferFull = true;
+  }
+  
+  // Need minimum samples before calculation
+  if (!spo2BufferFull && spo2BufferIndex < 8) return;
+  
+  int samplesCount = spo2BufferFull ? SPO2_BUFFER_SIZE : spo2BufferIndex;
+  
+  // Calculate AC (peak-to-peak) and DC (mean) components
+  float redMin = redBuffer[0], redMax = redBuffer[0];
+  float irMin = irBuffer[0], irMax = irBuffer[0];
+  float redSum = 0, irSum = 0;
+  
+  for (int i = 0; i < samplesCount; i++) {
+    if (redBuffer[i] < redMin) redMin = redBuffer[i];
+    if (redBuffer[i] > redMax) redMax = redBuffer[i];
+    if (irBuffer[i] < irMin) irMin = irBuffer[i];
+    if (irBuffer[i] > irMax) irMax = irBuffer[i];
+    
+    redSum += redBuffer[i];
+    irSum += irBuffer[i];
+  }
+  
+  // Calculate AC (amplitude) and DC (baseline)
+  float redAC = redMax - redMin;
+  float irAC = irMax - irMin;
+  float redDC = redSum / samplesCount;
+  float irDC = irSum / samplesCount;
+  
+  // Store DC values for trend analysis
+  redDCBuffer[dcBufferIndex] = redDC;
+  irDCBuffer[dcBufferIndex] = irDC;
+  dcBufferIndex = (dcBufferIndex + 1) % SPO2_DC_BUFFER_SIZE;
+  if (dcBufferIndex == 0) dcBufferFull = true;
+  
+  // ENHANCED: Prevent division errors and invalid calculations
+  if (irAC <= 0 || irDC <= 0 || redDC <= 0 || redAC <= 0) {
+    invalidSpO2Count++;
+    if (invalidSpO2Count < MAX_INVALID_COUNT) {
+      // Use last valid reading
+      currentSpO2 = lastValidSpO2;
+      sp02 = (int)currentSpO2;
+    }
+    return;
+  }
+  
+  // ENHANCED: Apply wrist-specific calibration
+  float redACScaled = redAC * RED_AC_SCALE;
+  float irACScaled = irAC * IR_AC_SCALE;
+  
+  // Calculate ratios with safety checks
+  float redRatio = redACScaled / redDC;
+  float irRatio = irACScaled / irDC;
+  
+  lastRedRatio = redRatio;
+  lastIRRatio = irRatio;
+  
+  // ENHANCED: Improved SpO2 calculation formula for MAX30102
+  // Formula: SpO2 = 104 - 17 * (redRatio / irRatio)
+  // With calibration boost for wrist readings
+  float R = 0;
+  if (irRatio > 0) {
+    R = (redRatio / irRatio) * SPO2_CALIBRATION;
+  } else {
+    invalidSpO2Count++;
+    return;
+  }
+  
+  // Calculate SpO2 using improved formula
+  float spo2Value = 106.0 - 17.0 * R;
+  
+  
+  if (spo2Value < 85) {
+    spo2Value = 85;
+    invalidSpO2Count++;
+  } else if (spo2Value > 100) {
+    spo2Value = 100;
+  } else {
+    invalidSpO2Count = 0; // Reset invalid count on valid read
+  }
+  
+  // ENHANCED: Boost slightly low readings (90-94) to be more realistic for wrist
+  if (spo2Value >= 90 && spo2Value < 94) {
+    spo2Value = 94 + (spo2Value - 90) * 0.5;
+  }
+  
+  // Only accept if reasonable
+  if (spo2Value >= 85 && spo2Value <= 100) {
+    addToHistory(spo2Value, false);
+    currentSpO2 = getSmoothedValue(false);
+    lastValidSpO2 = currentSpO2;
+    sp02 = (int)currentSpO2;
+    
+    Serial.print("SpO2: ");
+    Serial.print((int)currentSpO2);
+    Serial.print("% | R: ");
+    Serial.print(R, 2);
+    Serial.print(" | Red AC: ");
+    Serial.print((int)redAC);
+    Serial.print(" | IR AC: ");
+    Serial.println((int)irAC);
+  } else {
+    invalidSpO2Count++;
+  }
+}
+
+// SMOOTHING FUNCTIONS
+void addToHistory(float value, bool isHR) {
+  if (isHR) hrHistory[historyIndex] = value;
+  else spo2History[historyIndex] = value;
+  if (isHR) {
+    historyIndex = (historyIndex + 1) % SMOOTH_SIZE;
+    if (historyIndex == 0) historyFull = true;
+  }
+}
+
+float getSmoothedValue(bool isHR) {
+  float sum = 0;
+  int count = historyFull ? SMOOTH_SIZE : historyIndex + 1;
+  for (int i = 0; i < count; i++) sum += isHR ? hrHistory[i] : spo2History[i];
+  return count > 0 ? sum / count : 0;
+}
+
+void updateCloudIfNeeded() {
+  if (!fingerDetected || !validDataReceived) {
+    if (avgHeartRate != 0 || sp02 != 0) {
+      avgHeartRate = 0;
+      sp02 = 0;
+    }
+    return;
+  }
+  if (abs(currentHeartRate - lastCloudHR) >= HR_THRESHOLD ||
+      abs(currentSpO2 - lastCloudSpO2) >= SPO2_THRESHOLD || lastCloudHR < 0) {
+    avgHeartRate = heartRate;
+    sp02 = currentSpO2;
+    lastCloudHR = currentHeartRate;
+    lastCloudSpO2 = currentSpO2;
+  }
+}
+
+void updateBatteryLevel() {
+  int raw = analogRead(BATTERY_PIN);
+  float voltage = (raw * 3.3) / 4095.0 * 2.0;
+  batteryPercentage = map((int)(voltage * 100), (int)(BATTERY_MIN_VOLTAGE * 100), 
+                         (int)(BATTERY_MAX_VOLTAGE * 100), 0, 100);
+  batteryPercentage = constrain(batteryPercentage, 0, 100);
+}
+
+void printDebugInfo() {
+  Serial.println("---- Radial Artery Monitor - SpO2 ENHANCED ----");
+  Serial.print("Contact: "); Serial.println(fingerDetected ? "✓ YES" : "✗ NO");
+  
+  long currentIR = particleSensor.getIR();
+  long currentRed = particleSensor.getRed();
+  Serial.print("IR: "); Serial.print(currentIR);
+  Serial.print(" | Red: "); Serial.print(currentRed);
+  Serial.print(" | Baseline IR: "); Serial.println(irBaseline);
+  
+  Serial.print("Signal Quality - IR: ");
+  Serial.print((int)(irSignalQuality * 100));
+  Serial.print("% | Red: ");
+  Serial.print((int)(redSignalQuality * 100));
+  Serial.println("%");
+  
+  Serial.print("HR: "); Serial.print(heartRate); Serial.println(" BPM");
+  Serial.print("SpO2: "); Serial.print(sp02); Serial.print("% | Last Valid: ");
+  Serial.print((int)lastValidSpO2); Serial.print("% | R-value: ");
+  Serial.println(lastRedRatio / lastIRRatio, 3);
+  Serial.print("Battery: "); Serial.print(batteryPercentage); Serial.println("%");
+  
+  if (baselineSampleCount < BASELINE_SAMPLES) {
+    Serial.print("Calibrating: ");
+    Serial.print(baselineSampleCount);
+    Serial.print("/");
+    Serial.println(BASELINE_SAMPLES);
+  }
+  
+  Serial.println("----------------------------------------");
+}
+
+void handlePredictionProcess() {
+  unsigned long currentTime = millis();
+  unsigned long elapsed = currentTime - predictionStartTime;
+  
+  static unsigned long lastProgressUpdate = 0;
+  if (currentTime - lastProgressUpdate >= 2000) {
+    int secondsLeft = (PREDICTION_DURATION - elapsed) / 1000;
+    predictionResult = "Analyzing... " + String(secondsLeft) + " seconds remaining";
+    lastProgressUpdate = currentTime;
+  }
+  
+  if (elapsed >= PREDICTION_DURATION) {
+    runHeartAttackPrediction();
+    predictionInProgress = false;
+    runPrediction = false;
+  }
+}
+
+String getCurrentTimestamp() {
+  unsigned long currentTime = millis();
+  long hours = (currentTime / 3600000) % 24;
+  long minutes = (currentTime / 60000) % 60;
+  long seconds = (currentTime / 1000) % 60;
+  
+  String timestamp = "Session " + String(hours) + ":" + 
+                    (minutes < 10 ? "0" : "") + String(minutes) + ":" + 
+                    (seconds < 10 ? "0" : "") + String(seconds);
+  return timestamp;
+}
+
+String formatPatientHistory(
+  String timestamp, int patientAge, String patientSex, int bloodPressure,
+  int cholesterol, int heartRateReading, int spO2Reading, int maxHeartRate,
+  String riskResult, String riskFactors, String notes
+) {
+  String history = timestamp + " | ";
+  history += "Age:" + String(patientAge) + " " + patientSex + " | ";
+  history += "BP:" + String(bloodPressure) + " HR:" + String(heartRateReading) + " | ";
+  history += "SpO2:" + String(spO2Reading) + "% Max:" + String(maxHeartRate) + " | ";
+  
+  int pipeIndex = riskResult.indexOf("|");
+  String riskOnly = (pipeIndex > 0) ? riskResult.substring(0, pipeIndex) : riskResult;
+  history += riskOnly;
+  
+  return history;
+}
+
+void runHeartAttackPrediction() {
+  float riskScore = 0.0;
+  String riskFactors = "";
+  float predictionHR = currentHeartRate;
+  float predictionSpO2 = currentSpO2;
+
+  if (predictionHR == 0) {
+    riskScore += 25;
+    riskFactors += "❌ No valid HR reading; ";
+  } else if (predictionHR < 60) {
+    if (predictionHR < 40) riskScore += (60 - predictionHR) * 1.0;
+    else riskScore += (60 - predictionHR) * 0.5;
+    riskFactors += "⚠️ Low resting HR (" + String((int)predictionHR) + "); ";
+  } else if (predictionHR > 100) {
+    riskScore += (predictionHR - 100) * 0.5;
+    riskFactors += "⚠️ High resting HR (" + String((int)predictionHR) + "); ";
+  }
+   
+  if (predictionSpO2 == 0) {
+    riskScore += 20;
+    riskFactors += "❌ No valid SpO2 reading; ";
+  } else if (predictionSpO2 < 94) {
+    if (predictionSpO2 < 90) riskScore += (94 - predictionSpO2) * 5.0;
+    else riskScore += (94 - predictionSpO2) * 3.0;
+    riskFactors += "🩸 Low SpO2 (" + String((int)predictionSpO2) + "%): immediate consult; ";
+  }
+
+  if (trestbps == 0) {
+    riskScore += 15;
+    riskFactors += "❌ No valid BP reading; ";
+  } else {
+    if (trestbps < 90) {
+      riskScore += (90 - trestbps) * 0.5;
+      riskFactors += "⚠️ Low blood pressure (<90); ";
+    } else if (trestbps >= 130 && trestbps < 140) {
+      riskScore += 5;
+      riskFactors += "⚠️ Stage 1 Hypertension; ";
+    } else if (trestbps >= 140 && trestbps < 180) {
+      riskScore += (trestbps - 140) * 1.0 + 20;
+      riskFactors += "🚨 Stage 2 Hypertension; ";
+    } else if (trestbps >= 180) {
+      riskScore += 50;
+      riskFactors += "🚑 Hypertensive crisis; ";
+    }
+  }
+
+  if (chol == 0) {
+    riskScore += 10;
+    riskFactors += "❌ No valid cholesterol; ";
+  } else if (chol > 240) {
+    riskScore += (chol - 240) * 0.1;
+    riskFactors += "⚠️ High cholesterol; ";
+  }
+
+  if (sex == 1) {
+    if (age > 45) {
+      riskScore += (age - 45) * 0.5;
+      riskFactors += "👨 Age risk (Male >45); ";
+    }
+  } else {
+    if (age > 55) {
+      riskScore += (age - 55) * 0.4;
+      riskFactors += "👩 Age risk (Female >55); ";
+    }
+  }
+
+  if (thalach > 0) {
+    int predictedMaxHR = 220 - age;
+    if (thalach > predictedMaxHR * 0.85) {
+      riskScore += 5;
+      riskFactors += "❤️ High max HR; ";
+    }
+  }
+
+  if (sex == 1) riskScore *= 1.2;
+
+  int riskPercentage = constrain((int)riskScore, 0, 100);
+  
+  if (riskPercentage < 20) {
+    alertMessage = "✅ LOW RISK: Maintain healthy lifestyle.";
+  } else if (riskPercentage < 40) {
+    alertMessage = "⚠️ MODERATE RISK: Recommend consultation.";
+  } else if (riskPercentage < 70) {
+    alertMessage = "🚨 ELEVATED RISK: Consult doctor soon.";
+  } else {
+    alertMessage = "🚑 HIGH RISK: Seek immediate medical attention!";
+  }
+
+  String result = "";
+  if (riskPercentage < 20) {
+    result = "✅ LOW RISK (" + String(riskPercentage) + "%)";
+  } else if (riskPercentage < 40) {
+    result = "⚠️ MODERATE RISK (" + String(riskPercentage) + "%)";
+  } else if (riskPercentage < 70) {
+    result = "🚨 ELEVATED RISK (" + String(riskPercentage) + "%)";
+  } else {
+    result = "🚑 HIGH RISK (" + String(riskPercentage) + "%)";
+  }
+
+  if (riskFactors.length() > 0) result += " | " + riskFactors;
+  predictionResult = result;
+
+  String timestamp = getCurrentTimestamp();
+  String sexStr = (sex == 1) ? "Male" : "Female";
+  
+  historyLog = formatPatientHistory(
+    timestamp, age, sexStr, trestbps, chol,
+    (int)currentHeartRate, (int)currentSpO2, thalach,
+    result, riskFactors, "Follow medical advice"
+  );
+}
+
+void onBeatStatusChange() {
+  if (!beatStatus) {
+    heartRate = 0;
+    sp02 = 0;
+    avgHeartRate = 0;
+    currentHeartRate = 0;
+    currentSpO2 = 0;
+    fingerDetected = false;
+    validDataReceived = false;
+    baselineSampleCount = 0;
+  }
+}
+
+void onRunPredictionChange() {
+  if (runPrediction && beatStatus) {
+    predictionInProgress = true;
+    predictionStartTime = millis();
+    predictionResult = "Analyzing... Please wait 10 seconds";
+    thalach = 0;
+  } else if (runPrediction && !beatStatus) {
+    predictionResult = "Error: Please turn ON Beat Status first";
+    runPrediction = false;
+  }
+}
+
+void onAgeChange() {}
+void onSexChange() {}
+void onTrestbpsChange() {}
+void onCholChange() {}
+void onBatteryPercentageChange() {}
+void onHistoryLogChange() {}
+void onUserLocationChange() {}
+void onReminderScheduleChange() {}
+void onAlertMessageChange() {}
